@@ -3,6 +3,7 @@ from pyspark.sql import SparkSession
 from pyspark.sql.functions import from_json, col
 from kafka import KafkaProducer
 import json
+import random
 
 # Configuración de Spark
 spark = SparkSession.builder.appName('GitHubConsistency').getOrCreate()
@@ -17,6 +18,12 @@ repository_state = {
     "name": "LaboratorioDistribuidos",
     "version": "1.1",
     "locked": False # Indica si el repositorio está bloqueado para 'push'
+}
+
+replicas = {
+    "replica_1": repository_state,
+    "replica_2": repository_state,
+    "replica_3": repository_state
 }
 
 # Esquema para el DataFrame
@@ -35,6 +42,12 @@ parsed_df = requests_df.withColumn("data", from_json(col("json_str"), schema)).s
 # Configurar KafkaProducer para enviar respuestas
 producer = KafkaProducer(bootstrap_servers=KAFKA_SERVER, value_serializer=lambda v: json.dumps(v).encode('utf-8'))
 
+def synchronize_replicas(replica_state, selected_replica):
+    # Sincroniza todas las réplicas con la réplica seleccionada
+    for replica in replicas:
+        if replica != selected_replica:
+            replicas[replica] = replica_state.copy()
+
 # Lógica para manejar el 'push' y 'pull'
 def process_row(row):
     action = row['action']
@@ -42,6 +55,9 @@ def process_row(row):
     client_version = client.get('repository', {}).get('version', None)
     username = client['username']
     
+    # Simulación de un balanceador de carga
+    selected_replica = random.choice(list(replicas.keys()))
+    replica = replicas[selected_replica]
     
     # Lógica para manejar 'pull'
     if action == 'pull':
@@ -49,8 +65,8 @@ def process_row(row):
             response_message = {
                 "username": username,
                 "action": "pull",
-                "status": "Pull completed: Repository created. Version: {}".format(repository_state['version']),
-                "repository": repository_state
+                "status": "Pull completed: Repository created. Version: {}".format(replica['version']),
+                "repository": replica
             }
         elif client_version == repository_state['version']:
             response_message = {
@@ -62,24 +78,27 @@ def process_row(row):
             response_message = {
                 "username": username,
                 "action": "pull",
-                "status": "Pull completed: Updated to version {}".format(repository_state['version']),
-                "repository": repository_state
+                "status": "Pull completed: Updated to version {}".format(replica['version']),
+                "repository": replica
             }
     
     # Lógica para manejar 'push'
     elif action == 'push':
         if client['repository'] is None:
             response_message = {"username": username, "action": "push", "status": "Push denied: No repository found."}
-        elif client_version != repository_state['version']:
+        elif client_version != replica['version']:
             response_message = {"username": username, "action": "push", "status": "Push denied: Version mismatch. Please pull the latest version."}
-        elif repository_state['locked']:
+        elif replica['locked']:
             response_message = {"username": username, "action": "push", "status": "Push denied: Repository is locked."}
         else:
             # Actualizar el repositorio
-            repository_state['locked'] = True
-            repository_state['version'] = str(float(repository_state['version']) + 0.1)
-            repository_state['locked'] = False
-            response_message = {"username": username, "action": "push", "status": "Push accepted. New version: {}".format(repository_state['version'])}
+            replica['locked'] = True
+            replica['version'] = str(float(replica['version']) + 0.1)
+            replica['locked'] = False
+            response_message = {"username": username, "action": "push", "status": "Push accepted. New version: {}".format(replica['version'])}
+
+            # Sincronizar todas las réplicas
+            synchronize_replicas(replica, selected_replica)
 
     # Enviar la respuesta a través de Kafka
     producer.send(TOPIC_RESPONSES, response_message)
