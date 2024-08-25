@@ -1,61 +1,91 @@
 # server.py
-from kafka import KafkaConsumer, KafkaProducer
 from pyspark.sql import SparkSession
+from pyspark.sql.functions import from_json, col
+from kafka import KafkaProducer
 import json
-
-# Configuración de Kafka
-KAFKA_SERVER = 'localhost:9092'
-TOPIC = 'push-pull'
 
 # Configuración de Spark
 spark = SparkSession.builder.appName('GitHubConsistency').getOrCreate()
 
-# Simulación del estado del repositorio
-server_repository = {
+# Configuración de Kafka
+KAFKA_SERVER = 'localhost:9092'
+TOPIC_REQUESTS = 'repo-requests'
+TOPIC_RESPONSES = 'repo-responses'
+
+# Estado del repositorio
+repository_state = {
     "name": "LaboratorioDistribuidos",
-    "version": "1.1"
+    "version": "1.1",
+    "locked": False # Indica si el repositorio está bloqueado para 'push'
 }
 
-def process_message(message):
-    action = message.get('action')
-    client = message.get('client')
-    client_version = client['repository']['version'] if client['repository'] else 'None'
+# Esquema para el DataFrame
+schema = "action STRING, client STRUCT<username: STRING, repository: STRUCT<name: STRING, version: STRING>>"
+
+# Lectura de los mensajes desde Kafka
+kafka_df = spark.readStream.format("kafka") \
+    .option("kafka.bootstrap.servers", KAFKA_SERVER) \
+    .option("subscribe", TOPIC_REQUESTS) \
+    .load()
+
+# Conversión de los mensajes de Kafka a un DataFrame de Spark
+requests_df = kafka_df.selectExpr("CAST(value AS STRING) as json_str")
+parsed_df = requests_df.withColumn("data", from_json(col("json_str"), schema)).select("data.*")
+
+# Configurar KafkaProducer para enviar respuestas
+producer = KafkaProducer(bootstrap_servers=KAFKA_SERVER, value_serializer=lambda v: json.dumps(v).encode('utf-8'))
+
+# Lógica para manejar el 'push' y 'pull'
+def process_row(row):
+    action = row['action']
+    client = row['client']
+    client_version = client.get('repository', {}).get('version', None)
+    username = client['username']
     
-    print(f"Processing {action} from user {client['username']} with version {client_version}")
     
-    if action == 'push':
-        # Crear un DataFrame en Spark con la información del cliente y del servidor
-        data = [(client['username'], client_version, server_repository['version'])]
-        columns = ["username", "client_version", "server_version"]
-        df = spark.createDataFrame(data, columns)
-        
-        # Lógica de comparación de versiones con Spark
-        df = df.withColumn("allowed", df.client_version >= df.server_version)
-        
-        result = df.collect()[0]
-        
-        if result['allowed']:
-            print(f"Push allowed for {client['username']}")
-            # Actualizar la versión del repositorio en el servidor
-            server_repository['version'] = client['repository']['version']
+    # Lógica para manejar 'pull'
+    if action == 'pull':
+        if client['repository'] is None:
+            response_message = {
+                "username": username,
+                "action": "pull",
+                "status": "Pull completed: Repository created. Version: {}".format(repository_state['version']),
+                "repository": repository_state
+            }
+        elif client_version == repository_state['version']:
+            response_message = {
+                "username": username,
+                "action": "pull",
+                "status": "Pull skipped: Already up-to-date.",
+            }
         else:
-            print(f"Push denied for {client['username']} - outdated version")
+            response_message = {
+                "username": username,
+                "action": "pull",
+                "status": "Pull completed: Updated to version {}".format(repository_state['version']),
+                "repository": repository_state
+            }
     
-    elif action == 'pull':
-        # Simulación de pull
-        client['repository'] = server_repository
-        print(f"Pull completed for {client['username']} with version {server_repository['version']}")
-    
-    return client
+    # Lógica para manejar 'push'
+    elif action == 'push':
+        if client['repository'] is None:
+            response_message = {"username": username, "action": "push", "status": "Push denied: No repository found."}
+        elif client_version != repository_state['version']:
+            response_message = {"username": username, "action": "push", "status": "Push denied: Version mismatch. Please pull the latest version."}
+        elif repository_state['locked']:
+            response_message = {"username": username, "action": "push", "status": "Push denied: Repository is locked."}
+        else:
+            # Actualizar el repositorio
+            repository_state['locked'] = True
+            repository_state['version'] = str(float(repository_state['version']) + 0.1)
+            repository_state['locked'] = False
+            response_message = {"username": username, "action": "push", "status": "Push accepted. New version: {}".format(repository_state['version'])}
 
-def main():
-    # Configuración del consumidor y productor de Kafka
-    consumer = KafkaConsumer(TOPIC, bootstrap_servers=KAFKA_SERVER, value_deserializer=lambda x: json.loads(x.decode('utf-8')))
-    producer = KafkaProducer(bootstrap_servers=KAFKA_SERVER, value_serializer=lambda v: json.dumps(v).encode('utf-8'))
+    # Enviar la respuesta a través de Kafka
+    producer.send(TOPIC_RESPONSES, response_message)
 
-    for message in consumer:
-        updated_client = process_message(message.value)
-        producer.send(TOPIC, updated_client)
+# Aplicar la lógica a cada fila del DataFrame
+query = parsed_df.writeStream.foreach(process_row).start()
 
-if __name__ == '__main__':
-    main()
+# Esperar a que el streaming termine
+query.awaitTermination()
