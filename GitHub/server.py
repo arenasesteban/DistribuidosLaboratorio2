@@ -1,12 +1,12 @@
-# server.py
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import from_json, col
-from kafka import KafkaProducer
+import sys
+import six
+
+if sys.version_info >= (3, 12, 0):
+    sys.modules['kafka.vendor.six.moves'] = six.moves
+
+from kafka import KafkaProducer, KafkaConsumer
 import json
 import random
-
-# Configuración de Spark
-spark = SparkSession.builder.appName('GitHubConsistency').getOrCreate()
 
 # Configuración de Kafka
 KAFKA_SERVER = 'localhost:9092'
@@ -20,39 +20,30 @@ repository_state = {
     "locked": False # Indica si el repositorio está bloqueado para 'push'
 }
 
+# Diccionario de réplicas
 replicas = {
-    "replica_1": repository_state,
-    "replica_2": repository_state,
-    "replica_3": repository_state
+    "replica_1": repository_state.copy(),
+    "replica_2": repository_state.copy(),
+    "replica_3": repository_state.copy()
 }
 
-# Esquema para el DataFrame
-schema = "action STRING, client STRUCT<username: STRING, repository: STRUCT<name: STRING, version: STRING>>"
-
-# Lectura de los mensajes desde Kafka
-kafka_df = spark.readStream.format("kafka") \
-    .option("kafka.bootstrap.servers", KAFKA_SERVER) \
-    .option("subscribe", TOPIC_REQUESTS) \
-    .load()
-
-# Conversión de los mensajes de Kafka a un DataFrame de Spark
-requests_df = kafka_df.selectExpr("CAST(value AS STRING) as json_str")
-parsed_df = requests_df.withColumn("data", from_json(col("json_str"), schema)).select("data.*")
-
-# Configurar KafkaProducer para enviar respuestas
-producer = KafkaProducer(bootstrap_servers=KAFKA_SERVER, value_serializer=lambda v: json.dumps(v).encode('utf-8'))
+# Inicializar KafkaProducer para enviar respuestas
+producer = KafkaProducer(bootstrap_servers=KAFKA_SERVER, 
+                         value_serializer=lambda v: json.dumps(v).encode('utf-8'))
 
 def synchronize_replicas(replica_state, selected_replica):
-    # Sincroniza todas las réplicas con la réplica seleccionada
+    """Sincroniza todas las réplicas con la réplica seleccionada."""
     for replica in replicas:
         if replica != selected_replica:
             replicas[replica] = replica_state.copy()
 
-# Lógica para manejar el 'push' y 'pull'
-def process_row(row):
-    action = row['action']
-    client = row['client']
-    client_version = client.get('repository', {}).get('version', None)
+def process_message(message):
+    """Procesa un mensaje del cliente."""
+    action = message['action']
+    client = message['client']
+    
+    # Comprobar si el repository es None antes de intentar acceder a 'version'
+    client_version = client.get('repository', {}).get('version', None) if client['repository'] else None
     username = client['username']
     
     # Simulación de un balanceador de carga
@@ -68,7 +59,7 @@ def process_row(row):
                 "status": "Pull completed: Repository created. Version: {}".format(replica['version']),
                 "repository": replica
             }
-        elif client_version == repository_state['version']:
+        elif client_version == replica['version']:
             response_message = {
                 "username": username,
                 "action": "pull",
@@ -103,8 +94,16 @@ def process_row(row):
     # Enviar la respuesta a través de Kafka
     producer.send(TOPIC_RESPONSES, response_message)
 
-# Aplicar la lógica a cada fila del DataFrame
-query = parsed_df.writeStream.foreach(process_row).start()
+def main():
+    # Inicializar KafkaConsumer para recibir solicitudes
+    consumer = KafkaConsumer(TOPIC_REQUESTS, 
+                             bootstrap_servers=KAFKA_SERVER, 
+                             value_deserializer=lambda x: json.loads(x.decode('utf-8')))
 
-# Esperar a que el streaming termine
-query.awaitTermination()
+    print("Server is running and waiting for messages...")
+    
+    for message in consumer:
+        process_message(message.value)
+
+if __name__ == "__main__":
+    main()
