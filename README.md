@@ -46,7 +46,7 @@ Clona el repositorio en uan carpeta que te acomode
 Instala las dependencias utilizando `pip`:
 
 ```bash
-pip pip install confluent-kafka==2.1.1
+pip install confluent-kafka==2.1.1
 ```
 
 ### 4. Ejecución del Proyecto
