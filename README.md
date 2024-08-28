@@ -75,7 +75,7 @@ Una vez ejecutados ambos scripts, podrás observar cómo los mensajes de `push` 
 
 - **Python**: 3.12
 - **Apache Kafka**: 2.13.0
-- **Kafka-python**: 2.0.2
+- **confluent-kafka**: 2.5.0
 
 ## Notas
 
